@@ -68,6 +68,16 @@ typedef struct _ENetProtocolHeader
    enet_uint16 sentTime;
 } ENET_PACKED ENetProtocolHeader;
 
+typedef struct _ENetNewProtocolHeader
+{
+    enet_uint16 integrity[3]; // [0]=port, [1]=port^port, [2]=nonce
+    enet_uint16 peerID;
+    enet_uint16 sentTime;
+} ENET_PACKED ENetNewProtocolHeader;
+
+// Helper macro for minimal header size (before sentTime)
+#define ENET_NEW_PROTOCOL_HEADER_MIN_SIZE ((size_t) &((ENetNewProtocolHeader *)0)->sentTime)
+
 typedef struct _ENetProtocolCommandHeader
 {
    enet_uint8 command;

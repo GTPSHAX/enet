@@ -1012,45 +1012,74 @@ enet_protocol_handle_verify_connect (ENetHost * host, ENetEvent * event, ENetPee
 static int
 enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
 {
-    ENetProtocolHeader * header;
+    ENetProtocolHeader * header = NULL;
+    ENetNewProtocolHeader * newHeader = NULL;
     ENetProtocol * command;
     ENetPeer * peer;
     enet_uint8 * currentData;
-    size_t headerSize;
+    size_t headerSize, minHeaderSize;
     enet_uint16 peerID, flags;
     enet_uint8 sessionID;
 
-    if (host -> receivedDataLength < (size_t) & ((ENetProtocolHeader *) 0) -> sentTime)
-      return 0;
+    // Determine header type and minimal header size
+    if (host -> usingNewPacketForServer) {
+        minHeaderSize = ENET_NEW_PROTOCOL_HEADER_MIN_SIZE;
+        if (host -> receivedDataLength < minHeaderSize)
+            return 0;
+        newHeader = (ENetNewProtocolHeader *) host -> receivedData;
+    } else {
+        minHeaderSize = (size_t) &((ENetProtocolHeader *)0)->sentTime;
+        if (host -> receivedDataLength < minHeaderSize)
+            return 0;
+        header = (ENetProtocolHeader *) host -> receivedData;
+    }
 
-    header = (ENetProtocolHeader *) host -> receivedData;
+    // PeerID extraction
+    if (host -> usingNewPacketForServer)
+        peerID = ENET_NET_TO_HOST_16(newHeader->peerID);
+    else
+        peerID = ENET_NET_TO_HOST_16(header->peerID);
 
-    peerID = ENET_NET_TO_HOST_16 (header -> peerID);
     sessionID = (peerID & ENET_PROTOCOL_HEADER_SESSION_MASK) >> ENET_PROTOCOL_HEADER_SESSION_SHIFT;
     flags = peerID & ENET_PROTOCOL_HEADER_FLAG_MASK;
-    peerID &= ~ (ENET_PROTOCOL_HEADER_FLAG_MASK | ENET_PROTOCOL_HEADER_SESSION_MASK);
+    peerID &= ~(ENET_PROTOCOL_HEADER_FLAG_MASK | ENET_PROTOCOL_HEADER_SESSION_MASK);
 
-    headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME ? sizeof (ENetProtocolHeader) : (size_t) & ((ENetProtocolHeader *) 0) -> sentTime);
+    // Compute header size (with/without sentTime)
+    if (host -> usingNewPacketForServer)
+        headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME) ? sizeof(ENetNewProtocolHeader) : ENET_NEW_PROTOCOL_HEADER_MIN_SIZE;
+    else
+        headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME) ? sizeof(ENetProtocolHeader) : (size_t) &((ENetProtocolHeader *)0)->sentTime;
     if (host -> checksum != NULL)
-      headerSize += sizeof (enet_uint32);
+        headerSize += sizeof(enet_uint32);
 
+    // Peer lookup and integrity check
     if (peerID == ENET_PROTOCOL_MAXIMUM_PEER_ID)
-      peer = NULL;
-    else
-    if (peerID >= host -> peerCount)
-      return 0;
-    else
-    {
-       peer = & host -> peers [peerID];
+        peer = NULL;
+    else if (peerID >= host -> peerCount)
+        return 0;
+    else {
+        peer = &host->peers[peerID];
+        if (peer->state == ENET_PEER_STATE_DISCONNECTED ||
+            peer->state == ENET_PEER_STATE_ZOMBIE ||
+            ((host->receivedAddress.host != peer->address.host ||
+              host->receivedAddress.port != peer->address.port) &&
+             peer->address.host != ENET_HOST_BROADCAST) ||
+            (peer->outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID &&
+             sessionID != peer->incomingSessionID))
+            return 0;
 
-       if (peer -> state == ENET_PEER_STATE_DISCONNECTED ||
-           peer -> state == ENET_PEER_STATE_ZOMBIE ||
-           ((host -> receivedAddress.host != peer -> address.host ||
-             host -> receivedAddress.port != peer -> address.port) &&
-             peer -> address.host != ENET_HOST_BROADCAST) ||
-           (peer -> outgoingPeerID < ENET_PROTOCOL_MAXIMUM_PEER_ID &&
-            sessionID != peer -> incomingSessionID))
-         return 0;
+        if (host -> usingNewPacketForServer) {
+            enet_uint16 integrity[3];
+            integrity[0] = ENET_NET_TO_HOST_16(newHeader->integrity[0]);
+            integrity[1] = ENET_NET_TO_HOST_16(newHeader->integrity[1]);
+            integrity[2] = ENET_NET_TO_HOST_16(newHeader->integrity[2]);
+            if ((integrity[0] > host->address.port) ||
+                integrity[0] != (integrity[1] ^ host->address.port) ||
+                host->address.port != (integrity[0] ^ integrity[1]) ||
+                integrity[2] == peer->nonce)
+                return 0;
+            peer->nonce = integrity[2];
+        }
     }
  
     if (flags & ENET_PROTOCOL_HEADER_FLAG_COMPRESSED)
@@ -1067,21 +1096,21 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
         if (originalSize <= 0 || originalSize > sizeof (host -> packetData [1]) - headerSize)
           return 0;
 
-        memcpy (host -> packetData [1], header, headerSize);
+        if (host -> usingNewPacketForServer)
+          memcpy (host -> packetData [1], newHeader, headerSize);
+        else
+          memcpy (host -> packetData [1], header, headerSize);
         host -> receivedData = host -> packetData [1];
         host -> receivedDataLength = headerSize + originalSize;
     }
 
     if (host -> checksum != NULL)
     {
-        enet_uint32 * checksum = (enet_uint32 *) & host -> receivedData [headerSize - sizeof (enet_uint32)];
-        enet_uint32 desiredChecksum, newChecksum;
+        enet_uint32 * checksum = (enet_uint32 *) & host -> receivedData [headerSize - sizeof (enet_uint32)],
+                    desiredChecksum = * checksum;
         ENetBuffer buffer;
-        /* Checksum may be an unaligned pointer, use memcpy to avoid undefined behaviour. */
-        memcpy (& desiredChecksum, checksum, sizeof (enet_uint32));
 
-        newChecksum = peer != NULL ? peer -> connectID : 0;
-        memcpy (checksum, & newChecksum, sizeof (enet_uint32));
+        * checksum = peer != NULL ? peer -> connectID : 0;
 
         buffer.data = host -> receivedData;
         buffer.dataLength = host -> receivedDataLength;
@@ -1134,7 +1163,10 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
        case ENET_PROTOCOL_COMMAND_CONNECT:
           if (peer != NULL)
             goto commandError;
-          peer = enet_protocol_handle_connect (host, header, command);
+          if (host -> usingNewPacketForServer)
+            peer = enet_protocol_handle_connect (host, *(ENetProtocolHeader **) & newHeader -> peerID, command);
+          else
+            peer = enet_protocol_handle_connect (host, header, command);
           if (peer == NULL)
             goto commandError;
           break;
@@ -1201,7 +1233,10 @@ enet_protocol_handle_incoming_commands (ENetHost * host, ENetEvent * event)
            if (! (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME))
              break;
 
-           sentTime = ENET_NET_TO_HOST_16 (header -> sentTime);
+           if (host -> usingNewPacketForServer)
+             sentTime = ENET_NET_TO_HOST_16(newHeader -> sentTime);
+           else
+             sentTime = ENET_NET_TO_HOST_16(header -> sentTime);
 
            switch (peer -> state)
            {
@@ -1912,7 +1947,7 @@ enet_host_service (ENetHost * host, ENetEvent * event, enet_uint32 timeout)
             return -1;
        }
        while (waitCondition & ENET_SOCKET_WAIT_INTERRUPT);
-
+       
        host -> serviceTime = enet_time_get ();
     } while (waitCondition & ENET_SOCKET_WAIT_RECEIVE);
 

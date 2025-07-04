@@ -52,7 +52,7 @@ install_manifest.txt
 *.exp
 
 # Libraries
-*.lib
+# *.lib
 *.a
 *.la
 *.lo
